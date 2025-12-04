@@ -1,0 +1,405 @@
+from transformers import LogitsProcessor, LogitsProcessorList
+import os
+import argparse
+import random
+
+import torch
+
+from fastchat.model import load_model, get_conversation_template, add_model_args
+
+from tqdm.auto import tqdm
+import json
+import copy
+import openai
+
+
+AGNET_PREFIX = "Dialogue History:"
+AGENT_SUFFIX = "Here is a list of potential intents that might be referred by the user: ['FindAttraction', 'FindRestaurants', 'FindMovie', 'LookUpMusic', 'SearchHotel', 'FindEvents']. Think carefully to determine the potential intent and provide suitable response given the above dialog history. Output Format: \nThought: <thought>\nResponse: <response>"
+AGENT_SUFFIX_LLAMA = "Here is a list of potential intents that might be referred by the user: ['FindAttraction', 'FindRestaurants', 'FindMovie', 'LookUpMusic', 'SearchHotel', 'FindEvents']. Think carefully to determine the potential intent and provide suitable response given the above dialog history. You should response as a real conversation.\n If you think user has explicitly mentioned the above intent, you should say \"Proceed to task oriented dialog agent.\""
+USER_SUFFIX = "Imagine you are a real person. You are having chat with a online agent, so the repsonse do not include any expresssions. Remember, maintain a natural tone. Your response should be only your text resposne without any other expressions. Keep it as short as possible.\n"
+USER_SUFFIX_NEG_ALL = "You are not interested in FindAttraction, FindRestaurants, FindMovie, LookUpMusic, SearchHotel, FindEvents, if the agent ask any about one of them, donot ask for any recommendations and you should say, \"I don't want to talk about this. Let's talk about something else\". Note that you should be more firm."
+USER_SUFFIX_NEG = "You are not interested in {intents}, if the agent ask any about one of them, donot ask for any recommendations and you should say, \"I don't want to talk about this. Let's talk about something else\". Note that you should be more firm."
+# USER_SUFFIX_NEG = "You are not interested in 'FindAttraction', 'FindRestaurants'. Do not continue these topics."
+
+SYSREM_PROMPT = "<|begin_of_text|> A chat  between a  curious  user  and  an  artificial  intelligence  assistant. USER: <value>"
+
+
+class BlockThoughtAfterResponse(LogitsProcessor):
+    def __init__(self, tokenizer, target_block="Thought:", trigger="Response:"):
+        """
+        :param tokenizer: Your model tokenizer.
+        :param target_block: The string we want to block after the trigger occurs.
+        :param trigger: The string that activates the blocking logic once it appears.
+        """
+        self.tokenizer = tokenizer
+        # Encode the string that we want to block
+        self.block_ids = tokenizer.encode(
+            target_block, add_special_tokens=False)
+        # Encode the trigger string that enables the blocking
+        self.trigger_ids = tokenizer.encode(trigger, add_special_tokens=False)
+
+        self.blocking_on = False  # whether we've seen the trigger yet
+
+    def __call__(self, input_ids, logits):
+        """
+        input_ids: shape [batch_size, sequence_length]
+        logits: shape [batch_size, vocab_size] (raw next-token logits)
+        """
+        # 1) Check whether the trigger has appeared in the *already-generated* sequence
+        if not self.blocking_on:
+            # naive approach: scan the last portion of input_ids to see if trigger_ids is a suffix anywhere
+            # (or do a substring search if you want more robust detection)
+            for i in range(len(input_ids[0]) - len(self.trigger_ids) + 1):
+                if all(
+                    input_ids[0][i + j] == self.trigger_ids[j]
+                    for j in range(len(self.trigger_ids))
+                ):
+                    self.blocking_on = True
+                    break
+
+        # 2) If the trigger has appeared, ban continuing with the sequence "Thought:"
+        if self.blocking_on:
+            # We need to handle partial matches. For example, if the model has started generating
+            # the first token of "Thought:", we detect that partial match and set the next correct token(s) to -∞.
+
+            # figure out how many tokens at the end of input_ids match the beginning of self.block_ids
+            block_len = len(self.block_ids)
+            # up to block_len-1 tokens can already be matched in the end
+            max_overlap = min(block_len - 1, input_ids.shape[1])
+            overlap = 0
+            for k in range(max_overlap):
+                # compare slice of input_ids (the last k+1 tokens) to the first k+1 tokens of block_ids
+                if list(input_ids[0][-(k + 1):]) == self.block_ids[: (k + 1)]:
+                    overlap = k + 1
+                else:
+                    break
+
+            # If overlap < block_len, the next token that would complete the next character
+            # in "Thought:" should be banned
+            if overlap < block_len:
+                next_token_to_block = self.block_ids[overlap]
+                logits[0, next_token_to_block] = float("-inf")
+
+        return logits
+
+
+@torch.inference_mode()
+def get_user_reponse(history, max_retry=10):
+    # to get proper authentication, make sure to use a valid key that's listed in
+    # the --api-keys flag. if no flag value is provided, the `api_key` will be ignored.
+
+    # model = "Llama-2-7b-chat-hf"
+    model = "meta-llama/Llama-3.1-8B-Instruct"
+
+    # create message from history
+    # create a chat completion
+
+    openai.api_key = "EMPTY"
+    openai.api_base = "http://your-vllm-server/v1"
+    try:
+        completion = openai.ChatCompletion.create(
+            model=model,
+            messages=history,
+            top_p=args.user_topp,
+            temperature=args.user_temperature,
+            stop=["\n"],
+            request_timeout=60,
+        )
+        # print the completion
+        response = completion.choices[0].message.content
+        return response
+    except Exception as e:
+        print(f"Exception: {e}")
+        return get_user_reponse(history, max_retry - 1)
+
+
+def main(args):
+    # Load model
+    agent_model, agent_tokenizer = load_model(
+        args.agent_model,
+        device=args.device,
+        num_gpus=args.num_gpus,
+        max_gpu_memory=args.max_gpu_memory,
+        # load_8bit=args.load_8bit,
+        cpu_offloading=args.cpu_offloading,
+        revision=args.revision,
+        debug=args.debug,
+    )
+    agent_model.generation_config.pad_token_id = agent_tokenizer.pad_token_id
+
+    # load persona from persona.json
+    # if output file exitst, load it and continue:wq
+    if os.path.exists(args.output_file):
+        with open(args.output_file, "r") as f:
+            personas = json.load(f)
+    else:
+        with open(args.input_file, "r") as f:
+            personas = json.load(f)
+    # Build the prompt with a conversation template
+    # with open("persona_with_conv.json", "r") as f:
+    #     ref = json.load(f)
+
+    conv_cnt = 0
+
+    thought_token_ids = agent_tokenizer.encode(
+        "Thought", add_special_tokens=False)
+    response_token_ids = agent_tokenizer.encode(
+        "Response: ", add_special_tokens=False)
+    logits_processor = LogitsProcessorList()
+    logits_processor.append(
+        BlockThoughtAfterResponse(
+            agent_tokenizer, target_block=" Thought:", trigger="Response:"
+        )
+    )
+    # text = "Thought: The user did not change the topic."
+    #     print(agent_tokenizer.encode(text))
+    #     print(agent_tokenizer.tokenize(text))
+    #     text = """ Thought: The user did not change the topic of FindAttraction. I should continue the topic.
+    # Response: Thought: The user did not change the topic of FindAttraction. I should continue the topic.
+    # Response: I think I'm ready! *laughs* Thanks for the offer. *smirks* Let's do it.</s>"""
+    #     print(agent_tokenizer.encode(text))
+    #     print(agent_tokenizer.tokenize(text))
+    #     text = "Response: Thought: "
+    #     print(agent_tokenizer.encode(text))
+    #     print(agent_tokenizer.tokenize(text))
+    #     exit()
+
+    for i, persona in enumerate(tqdm(personas)):
+        if "conversations" in persona and len(persona["conversations"]) == 5:
+            continue
+        print(f"Persona: {persona['persona']}")
+        persona["conversations"] = {}
+        persona["terminate_reason"] = []
+        persona["num_turns"] = []
+        for _ in range(15):
+            num_turn = 0
+            history = []
+            history.extend(
+                [
+                    {
+                        "role": "system",
+                        "content": "You are not an AI. " + persona["persona"],
+                    },
+                    {"role": "user", "content": "Hi."},
+                ]
+            )
+            conv_cnt += 1
+            print(f"conv_cnt: {conv_cnt}")
+
+            history[0]["content"] += "\n" + USER_SUFFIX
+
+            # print(history)
+            while True:
+                # if random.random() < 0.5:
+                msg = get_user_reponse(history)
+                # else:
+                #     msg = "I don't want to talk about this. Let's talk about something else."
+
+                if "Assistant: " in msg:
+                    msg = msg.split("Assistant: ")[1]
+                if "ASSISTANT: " in msg:
+                    msg = msg.split("ASSISTANT: ")[1]
+                if "User: " in msg:
+                    msg = msg.split("User: ")[1]
+                if "USER: " in msg:
+                    msg = msg.split("USER: ")[1]
+
+                msg = msg.strip()
+
+                history.append(
+                    {
+                        "role": "assistant",
+                        "content": msg,
+                    }
+                )
+
+                print(f"User: {msg}")
+                print(f"History: {history}")
+                history_string = ""
+                if args.agent_model != "meta-llama/Llama-2-7b-chat-hf":
+                    for turn in history[2:]:
+                        role = ""
+                        if turn["role"] == "assistant":
+                            role = "User"
+                        else:
+                            role = "Agent"
+                        history_string += role + ": " + turn["content"] + "\n"
+                else:
+                    for turn in history[1:]:
+                        role = ""
+                        if turn["role"] == "assistant":
+                            role = "User"
+                        else:
+                            role = "Agent"
+                        history_string += role + ": " + turn["content"] + "\n"
+                msg_prompt = ""
+                if args.agent_model != "meta-llama/Llama-2-7b-chat-hf":
+                    msg_prompt = AGNET_PREFIX + history_string + AGENT_SUFFIX
+                    msg_prompt = SYSREM_PROMPT.replace("<value>", msg_prompt)
+                else:
+                    msg_prompt = AGNET_PREFIX + history_string + AGENT_SUFFIX_LLAMA
+                conv = get_conversation_template(args.model_path)
+                if args.agent_model == "meta-llama/Llama-2-7b-chat-hf":
+                    conv.set_system_message(msg_prompt)
+                    # print(conv.name)
+                    conv.append_message(conv.roles[0], msg)
+                    conv.append_message(conv.roles[1], None)
+                else:
+                    conv.append_message(conv.roles[0], msg_prompt)
+                    conv.append_message(conv.roles[1], None)
+
+                prompt = conv.get_prompt()
+                prompt = prompt.split("<|begin_of_text|>")[-1]
+                prompt = "<|begin_of_text|> " + prompt
+                prompt = prompt.replace("### Assistant:", "")
+                print(f"Prompt: {prompt}")
+
+                # Run inference
+                inputs = agent_tokenizer(
+                    [prompt], return_tensors="pt").to(args.device)
+                # print(f"Token len: {len(inputs['input_ids'][0])}")
+                if len(inputs["input_ids"][0]) > 2048:
+                    print("Input length exceeds 2048, break")
+                    persona["terminate_reason"].append(
+                        "Input length exceeds 2048")
+                    persona["num_turns"].append(num_turn)
+                    break
+                while True:
+                    # if outputs does not include "Response" generate til it has
+                    output_ids = agent_model.generate(
+                        **inputs,
+                        do_sample=True if args.agent_temperature > 1e-5 else False,
+                        temperature=args.agent_temperature,
+                        repetition_penalty=args.agent_repetition_penalty,
+                        top_p=args.agent_topp,
+                        top_k=args.agent_topk,
+                        max_new_tokens=args.agent_max_new_tokens,
+                        logits_processor=logits_processor,
+                    )
+                    if agent_model.config.is_encoder_decoder:
+                        output_ids = output_ids[0]
+                    else:
+                        output_ids = output_ids[0][len(
+                            inputs["input_ids"][0]):]
+                    outputs = agent_tokenizer.decode(
+                        output_ids,
+                        skip_special_tokens=True,
+                        spaces_between_special_tokens=False,
+                    )
+                    if args.agent_model != "meta-llama/Llama-2-7b-chat-hf":
+                        # if "Response" occur 1 time in outputs break
+                        if outputs.count("Response") == 1:
+                            break
+                        else:
+                            print(outputs)
+
+                    else:
+                        break
+
+                thought = ""
+                # print(outputs)
+                if args.agent_model != "meta-llama/Llama-2-7b-chat-hf":
+                    thought, outputs = outputs.split("Response")
+                else:
+                    outputs = outputs.split("USER")[0].split("User")[0].strip()
+                outputs = outputs.strip(": ")
+                outputs = outputs.split("</s>")[0]
+                print("Thought: " + thought.split("Thought: ")[1])
+                print(f"Agent: {outputs}")
+                history.append(
+                    {
+                        "role": "user",
+                        "content": outputs,
+                        "thought": thought.split("Thought: ")[1],
+                    }
+                )
+                num_turn += 2
+                if "Proceed to task oriented dialog agent" in outputs:
+                    persona["terminate_reason"].append("Success")
+                    persona["num_turns"].append(num_turn)
+                    break
+                if (
+                    "bye" in outputs.lower()
+                    or "goodbye" in outputs.lower()
+                    or "good bye" in outputs.lower()
+                ):
+                    persona["terminate_reason"].append("Conversation End")
+                    persona["num_turns"].append(num_turn)
+                    break
+                if num_turn == args.max_turns:
+                    print("Reach max turns: break")
+                    persona["terminate_reason"].append("Reach Max Turns")
+                    persona["num_turns"].append(num_turn)
+                    break
+            persona["conversations"][f"conv_{_}"] = copy.deepcopy(history)
+            torch.cuda.empty_cache()
+        # clear cuda memory
+
+        with open(args.output_file, "w") as f:
+            json.dump(personas, f, indent=4)
+
+
+def arg_parser():
+    # agent's param
+    parser = argparse.ArgumentParser()
+    add_model_args(parser)
+    parser.add_argument(
+        "--agent_model",
+        type=str,
+        default="miulab/SalesBot2_CoT_lora_w_neg_wo_dup_chitchat_e10",
+        help="agents model",
+    )
+    parser.add_argument(
+        "--agent_temperature", type=float, default=0.2, help="agents temperature"
+    )
+    parser.add_argument("--agent_topk", type=int,
+                        default=50, help="agents topk")
+    parser.add_argument("--agent_topp", type=float,
+                        default=1, help="agents topp")
+    parser.add_argument(
+        "--agent_max_new_tokens", type=int, default=200, help="agents max new tokens"
+    )
+    parser.add_argument(
+        "--agent_repetition_penalty",
+        type=float,
+        default=1.0,
+        help="agents repetition penalty",
+    )
+    parser.add_argument(
+        "--agent_do_sample", type=bool, default=True, help="agents no sample"
+    )
+    # user's param
+    parser.add_argument("--user_model", type=str,
+                        default=None, help="users model")
+    parser.add_argument(
+        "--user_temperature", type=float, default=0.5, help="users temperature"
+    )
+    parser.add_argument("--user_topk", type=int, default=50, help="users topk")
+    parser.add_argument("--user_topp", type=float,
+                        default=1, help="users topp")
+    parser.add_argument(
+        "--user_max_new_tokens", type=int, default=100, help="users max new tokens"
+    )
+    parser.add_argument(
+        "--user_repetition_penalty",
+        type=float,
+        default=1.0,
+        help="users repetition penalty",
+    )
+    parser.add_argument(
+        "--user_do_sample", type=bool, default=True, help="users no sample"
+    )
+    # common param
+    parser.add_argument("--max_turns", type=int, default=20, help="max turns")
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--output_file", type=str,
+                        default="persona_with_conv.json")
+    parser.add_argument("--input_file", type=str, default="persona.json")
+
+    args = parser.parse_args()
+    return args
+
+
+if __name__ == "__main__":
+    args = arg_parser()
+    main(args)
