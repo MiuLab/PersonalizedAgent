@@ -1,5 +1,7 @@
 # From Simulation to Strategy: Automating Personalized Interaction Planning for Conversational Agents
 
+<img width="945" height="667" alt="image" src="https://github.com/user-attachments/assets/46bbd5fe-18fb-4abd-bd76-e573057195f4" />
+
 ## Environment
 
 - Python 3.11
